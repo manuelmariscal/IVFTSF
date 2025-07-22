@@ -38,17 +38,27 @@ def shape_loss(ŷ_log, days):
     return ((ŷ_log[idx] - gs) ** 2).mean()
 
 # ---------- DataLoaders equilibrados --------------------------------------
-def make_loader(ds, bs, shuffle):
-    # peso ×2 para registros con día ≥15
-    weights = np.where(ds.groups[0]["measure_day"].to_numpy()[:,None] >= 15, 2.0, 1.0)
-    weights = np.concatenate([np.full(len(g), 2.0 if g["measure_day"].mean()>=15 else 1.0)
-                              for g in ds.groups])
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-    return DataLoader(ds, batch_size=bs,
-                      sampler=sampler if shuffle else None,
-                      shuffle=False if shuffle else False,
-                      num_workers=max(1, os.cpu_count()-1),
-                      pin_memory=torch.cuda.is_available())
+def make_loader(ds: HormoneDataset, bs: int, shuffle: bool):
+    """
+    Un peso por PACIENTE: >1 si la media del día de ciclo ≥15 (luteal),
+    1.0 en caso contrario. (len(weights) == len(ds))
+    """
+    w = np.array(
+        [2.0 if g["measure_day"].mean() >= 15 else 1.0
+         for g in ds.groups],
+        dtype=np.float32,
+    )
+    sampler = (
+        WeightedRandomSampler(w, num_samples=len(w), replacement=True)
+        if shuffle else None
+    )
+    return DataLoader(
+        ds, batch_size=bs,
+        sampler=sampler,
+        shuffle=shuffle and sampler is None,
+        num_workers=max(1, os.cpu_count() - 1),
+        pin_memory=torch.cuda.is_available(),
+    )
 
 # ---------- epoch ---------------------------------------------------------
 def run_epoch(dl, model, opt=None):
