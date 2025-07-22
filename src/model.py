@@ -1,3 +1,9 @@
+"""
+model.py – Transformer con embeddings de paciente, fase y posición sen-cos.
+"""
+from __future__ import annotations
+import torch, math, torch.nn as nn
+
 class HormoneTransformer(nn.Module):
     def __init__(self, num_features:int, num_patients:int,
                  d_model:int=64, nhead:int=4, num_layers:int=4,
