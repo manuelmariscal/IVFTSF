@@ -184,7 +184,7 @@ def main():
             break
 
     # Evaluación test
-    ckpt = torch.load(MODEL_DIR / "model.pt", map_location=DEVICE, weights_only=True)
+    ckpt = torch.load(MODEL_DIR / "model.pt", map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     test_mape = run_epoch(te_ld, model, gold_log=gold_log)
     logger.info("🧪  Test MAPE: %.2f%% (best val=%.2f%%)", test_mape, best)
