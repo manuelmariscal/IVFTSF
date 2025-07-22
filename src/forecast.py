@@ -48,16 +48,22 @@ def mc_dropout_predict(model, x, pid, days, phase, mask, mc=100):
 
 
 def create_sequence(js, means, stds):
-    S = 33
-    full_days = np.arange(1, S + 1)
+    S          = 33
+    full_days  = np.arange(1, S + 1)
 
     obs = pd.DataFrame(js["observations"]).copy()
+
+    # seno / coseno posicional
     ang = 2 * math.pi * (obs["measure_day"] - 1) / 28.0
     obs["pos_sin"], obs["pos_cos"] = np.sin(ang), np.cos(ang)
 
     feat = CSV_FEATURES + ["pos_sin", "pos_cos"]
+
+    # -------- AÑADIR columnas faltantes ----------
     for c in feat:
-        obs.setdefault(c, 0.0)
+        if c not in obs.columns:
+            obs[c] = 0.0
+    # ---------------------------------------------
 
     obs = (obs.set_index("measure_day")
                .reindex(full_days)
@@ -71,11 +77,12 @@ def create_sequence(js, means, stds):
     obs[feat] = (obs[feat] - means[feat]) / stds[feat]
 
     x     = torch.tensor(obs[feat].values, dtype=torch.float32).unsqueeze(0)
-    days  = torch.tensor(full_days,  dtype=torch.int64 ).unsqueeze(0)
+    days  = torch.tensor(full_days, dtype=torch.int64 ).unsqueeze(0)
     phase = torch.tensor(phase_from_day(full_days),
                          dtype=torch.int64 ).unsqueeze(0)
     mask  = torch.ones(1, S, dtype=torch.bool)
     return x, days, phase, mask
+
 
 
 # ───────────────────── main ─────────────────────────
