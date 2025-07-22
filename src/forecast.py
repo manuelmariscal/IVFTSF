@@ -1,184 +1,181 @@
 """
-forecast.py – Genera curva 1..33 con MC‑Dropout (±2 σ) y soporte para pacientes nuevos.
+forecast.py – Genera la curva 1‑33 con MC‑Dropout, positional‑encoding
+y la regularización de fase exactamente igual que en entrenamiento.
 """
 
 from __future__ import annotations
-import json, math
+import json, math, sys
 from pathlib import Path
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import matplotlib.pyplot as plt
 
-from .model    import HormoneTransformer
-from .dataset  import CSV_FEATURES          # ← solo las columnas de entrada
-from .utils    import MODEL_DIR, SPLIT_DIR, setup_logger
+from .model   import HormoneTransformer
+from .dataset import CSV_FEATURES         # ← columnas de entrada
+from .utils   import MODEL_DIR, SPLIT_DIR, setup_logger
 
 logger = setup_logger("forecast")
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
-EPS     = 1e-6
+EPS     = 1e-6                            # para MAPE si lo necesitas
 
-# ────────────────────────────────────────────────────────────────────────────
+
+# ───────────────────────── helpers ──────────────────────────────────────
 def load_ckpt():
-    return torch.load(MODEL_DIR / "model.pt", map_location=DEVICE, weights_only=False)
+    return torch.load(MODEL_DIR / "model.pt", map_location=DEVICE,
+                      weights_only=False)       # ← guardamos full‑state
 
-# -- MC‑Dropout --------------------------------------------------------------
-def mc_dropout_predict(
-        model: HormoneTransformer,
-        x: torch.Tensor, pid: torch.Tensor,
-        days: torch.Tensor, phase: torch.Tensor,
-        mask: torch.Tensor, mc_samples: int = 100
-):
+
+def phase_from_day(days: np.ndarray) -> np.ndarray:
     """
-    x      : (1,S,F)
-    pid    : (1,)
-    days   : (1,S)
-    phase  : (1,S)
-    mask   : (1,S)  True -> token real
+    Regla simple:
+      • 1‑9   → 0 (folicular)
+      • 10‑14 → 1 (ovulatoria)
+      • 15‑28 → 2 (lútea)
+      • 29‑33 → 3 (próximo ciclo)
     """
-    model.train(True)                 # activar dropout
+    phase   = np.full_like(days, 3)
+    phase[days <= 28] = 2
+    phase[days <= 14] = 1
+    phase[days <= 9]  = 0
+    return phase
+
+
+def mc_dropout_predict(model, x, pid, days, phase, mask, mc=100):
+    """Corre MC‑Dropout y devuelve media μ y desv. estándar σ."""
+    model.train(True)          # deja dropout encendido
     preds = []
     with torch.no_grad():
-        for _ in range(mc_samples):
-            y_log = model(
-                x, pid, days, phase,
-                src_key_padding_mask=~mask
-            )                         # (1,S)
+        for _ in range(mc):
+            y_log = model(x, pid, days, phase, src_key_padding_mask=~mask)
             preds.append(torch.expm1(y_log).clamp_min(0).cpu().numpy())
-    arr = np.stack(preds)             # (mc,1,S)
+    arr = np.stack(preds)      # (mc, 1, S)
     return arr.mean(0).squeeze(0), arr.std(0).squeeze(0)
 
-# -- Construye la secuencia 1..33 -------------------------------------------
-def create_sequence_from_json(js: dict,
-                              means: pd.Series,
-                              stds:  pd.Series):
+
+def create_sequence(js: dict,
+                    means: pd.Series,
+                    stds : pd.Series) -> tuple[torch.Tensor, torch.Tensor,
+                                               torch.Tensor, torch.Tensor]:
     """
     Devuelve:
-        x      : (1,S=33,F)  features normalizadas
-        days   : (1,33)      1..33
-        phase  : (1,33)      0=follicular,1=ovulatoria,2=lútea
-        mask   : (1,33)      todos True (no hay padding)
+        x     : (1,S,F)   – features normalizadas
+        days  : (1,S) int – 1‑33
+        phase : (1,S) int – 0‑3
+        mask  : (1,S) bool (todo True en forecast completo)
     """
     obs = pd.DataFrame(js["observations"])
+    S   = 33
+    full_days = np.arange(1, S+1)         # 1‥33
 
-    # día 1‑33 completo
-    days_full = np.arange(1, 34)
+    # — posicional Seno/Cos —
+    ang = 2 * math.pi * (obs["measure_day"]-1) / 28.0
+    obs["pos_sin"], obs["pos_cos"] = np.sin(ang), np.cos(ang)
 
-    # posicionales seno/coseno
-    ang = 2 * math.pi * (obs["measure_day"] - 1) / 28.0
-    obs["pos_sin"] = np.sin(ang)
-    obs["pos_cos"] = np.cos(ang)
+    feat = CSV_FEATURES + ["pos_sin", "pos_cos"]
 
-    feat_cols = CSV_FEATURES + ["pos_sin", "pos_cos"]
-
-    # asegúrate de que todas las columnas existan
-    for c in feat_cols:
+    # asegura columnas
+    for c in feat:
         if c not in obs.columns:
             obs[c] = 0.0
 
-    # re‑indexar a 1..33 e interpolar linealmente
-    obs = (
-        obs.set_index("measure_day")
-           .sort_index()
-           .reindex(days_full)
-    )
-    if obs.iloc[0].isna().all():
-        logger.warning("No hay observación en día 1; se extrapola hacia atrás.")
-    if obs.iloc[27].isna().all():
-        logger.warning("No hay observación en día 28; extrapolación hacia adelante.")
-    obs[feat_cols] = obs[feat_cols].interpolate("linear").bfill().ffill()
+    obs = obs.set_index("measure_day").sort_index()
+    # avisos de extremos
+    if 1   not in obs.index: logger.warning("No hay observación en día 1; interpolando.")
+    if 28  not in obs.index: logger.warning("No hay observación en día 28; interpolando.")
 
-    # normalizar
-    obs_norm = obs[feat_cols].copy()
-    for c in feat_cols:
-        obs_norm[c] = (obs_norm[c] - means[c]) / stds[c]
+    # re‑index e interpolar linealmente
+    obs = obs.reindex(full_days, method=None)
+    obs[feat] = obs[feat].interpolate("linear").bfill().ffill()
 
-    x     = torch.tensor(obs_norm.to_numpy(np.float32)).unsqueeze(0)          # (1,33,F)
-    mask  = torch.ones(1, 33, dtype=torch.bool)
-    days  = torch.tensor(days_full, dtype=torch.int64).unsqueeze(0)           # (1,33)
-    phase = torch.where(days <= 9, 0,
-             torch.where(days <= 14, 1, 2)).to(torch.int64)                  # (1,33)
+    # normaliza
+    obs[feat] = (obs[feat] - means[feat]) / stds[feat]
+
+    x     = torch.tensor(obs[feat].to_numpy(np.float32)).unsqueeze(0)  # (1,S,F)
+    days  = torch.tensor(full_days,  dtype=torch.int64).unsqueeze(0)   # (1,S)
+    phase = torch.tensor(phase_from_day(full_days),
+                         dtype=torch.int64).unsqueeze(0)               # (1,S)
+    mask  = torch.ones(1, S, dtype=torch.bool)
 
     return x, days, phase, mask
 
-# -- Pipeline completo -------------------------------------------------------
+
+# ────────────────────────── main pipeline ───────────────────────────────
 def forecast_from_json(json_path: str | Path):
-    js   = json.loads(Path(json_path).read_text())
-    ckpt = load_ckpt()
+    js    = json.loads(Path(json_path).read_text())
+    ckpt  = load_ckpt()
 
-    means = pd.Series(ckpt["mean"], index=[*CSV_FEATURES, "pos_sin", "pos_cos"])
-    stds  = pd.Series(ckpt["std"],  index=[*CSV_FEATURES, "pos_sin", "pos_cos"])
+    # estadísticas de entrenamiento
+    stats_cols = [*CSV_FEATURES, "pos_sin", "pos_cos"]
+    means = pd.Series(ckpt["mean"], index=stats_cols)
+    stds  = pd.Series(ckpt["std"],  index=stats_cols)
 
-    # pacientes vistos en entrenamiento
-    train_df  = pd.read_csv(SPLIT_DIR / "train.csv")
-    pid2idx   = {pid: i for i, pid in enumerate(train_df["id"].unique())}
-    N_patients = len(pid2idx)
+    # mapa de pacientes vistos
+    tr_df    = pd.read_csv(SPLIT_DIR/"train.csv")
+    pid2idx  = {pid:i for i,pid in enumerate(tr_df["id"].unique())}
+    n_pids   = len(pid2idx)
 
-    # reconstruir modelo con mismo d_model
-    d_model = ckpt["model_state"]["num_proj.weight"].shape[0]
-    model   = HormoneTransformer(
+    # — construye el modelo con la misma arquitectura que se guardó —
+    state = ckpt["model_state"]
+    d_model = state["num_proj.weight"].shape[0]
+    model = HormoneTransformer(
         num_features=len(CSV_FEATURES)+2,
-        num_patients=N_patients,
-        d_model=d_model, nhead=4,
-        num_layers=4, d_ff=512, dropout=0.12
+        num_patients=n_pids,
+        d_model=d_model, nhead=4, num_layers=4, d_ff=512, dropout=0.12
     ).to(DEVICE)
-    model.load_state_dict(ckpt["model_state"], strict=False)
+    model.load_state_dict(state, strict=False)
 
-    # id de paciente
-    patient_id = js["patient_id"]
-    if patient_id in pid2idx:
-        pid_idx = pid2idx[patient_id]
+    # patient idx (embedding)
+    patient = js["patient_id"]
+    if patient in pid2idx:
+        pid_idx = pid2idx[patient]
     else:
-        logger.warning("Paciente %s no visto en entrenamiento – usando embedding medio.", patient_id)
-        pid_idx = 0
+        logger.warning("Paciente %s no visto en entrenamiento – embedding medio.", patient)
         with torch.no_grad():
-            emb_mean = model.pid_emb.weight.mean(0, keepdim=True)
+            mean_emb = model.pid_emb.weight.mean(0, keepdim=True)
             model.pid_emb = torch.nn.Embedding.from_pretrained(
-                emb_mean.repeat(N_patients,1), freeze=False
-            )
+                mean_emb.repeat(n_pids,1), freeze=False)
+        pid_idx = 0
+    pid = torch.tensor([pid_idx], dtype=torch.long, device=DEVICE)
 
-    # ---- tensorización de la secuencia
-    x, days, phase, mask = create_sequence_from_json(js, means, stds)
-    pid_tensor = torch.tensor([pid_idx], dtype=torch.long)
+    # — secuencia normalizada —
+    x, days, phase, mask = create_sequence(js, means, stds)
+    x, days, phase, mask = [t.to(DEVICE) for t in (x, days, phase, mask)]
 
-    mc_samples = js.get("mc_samples", 100)
-    μ, σ = mc_dropout_predict(
-        model,
-        x.to(DEVICE),
-        pid_tensor.to(DEVICE),
-        days.to(DEVICE),
-        phase.to(DEVICE),
-        mask.to(DEVICE),
-        mc_samples=mc_samples
-    )
+    # — MC‑Dropout —
+    mc      = js.get("mc_samples", 100)
+    μ, σ    = mc_dropout_predict(model, x, pid, days, phase, mask, mc)
 
-    # -- guardar resultados --------------------------------------------------
-    out_png = Path(js.get("output", f"figures/forecast_{patient_id}.png"))
+    # — guardar resultados —
+    out_png = Path(js.get("output", f"figures/forecast_{patient}.png"))
     out_csv = out_png.with_suffix(".csv")
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
-    days_np = np.arange(1,34)
-    df_out  = pd.DataFrame({
-        "day": days_np,
+    full_days = np.arange(1, 34)
+    df = pd.DataFrame({
+        "day": full_days,
         "prediction": μ,
         "lower": np.clip(μ - 2*σ, 0, None),
-        "upper": μ + 2*σ
+        "upper": μ + 2*σ,
     })
-    df_out.to_csv(out_csv, index=False)
+    df.to_csv(out_csv, index=False)
 
     plt.figure(figsize=(10,4))
-    plt.plot(days_np, μ, label="Predicción")
-    plt.fill_between(days_np, df_out["lower"], df_out["upper"],
-                     alpha=0.3, label="±2σ")
-    plt.xlabel("Día ciclo (1‑33)")
-    plt.ylabel("Estradiol (E2)")
-    plt.title(f"Forecast paciente {patient_id}")
+    plt.plot(df["day"], df["prediction"], label="predicción")
+    plt.fill_between(df["day"], df["lower"], df["upper"], alpha=.25, label="±2σ")
+    plt.xlabel("Día del ciclo (1‑33)")
+    plt.ylabel("E2 (pg/mL)")
+    plt.title(f"Forecast paciente {patient}")
     plt.legend(); plt.tight_layout()
     plt.savefig(out_png, dpi=150); plt.close()
 
-    logger.info("Forecast guardado → %s  y  %s", out_png, out_csv)
+    logger.info("✅ Forecast guardado: %s  (+ CSV)", out_png)
 
-# ---------------------------------------------------------------------------
+
+# ────────────────────── CLI ──────────────────────────
 if __name__ == "__main__":
-    import sys
+    if len(sys.argv) < 2:
+        print("Uso:  python -m src.forecast  forecast_input.json")
+        sys.exit(1)
     forecast_from_json(sys.argv[1])
