@@ -66,24 +66,22 @@ def run_epoch(dl, model, opt=None):
     model.train(train)
     tot, n = 0.0, 0
     for b in dl:
-        m = b["mask"].to(DEVICE); real = m.sum()
-        if real==0: continue
-        x  = b["x"].to(DEVICE)
-        y  = b["y"].to(DEVICE)
-        pid= b["pid"].to(DEVICE)
-        ph = b["phase"].to(DEVICE)
-        dy = b["days"].to(DEVICE)
+        m = b["mask"].to(DEVICE)
+        if m.sum() == 0:
+            continue
+        x, y_raw, pid = b["x"].to(DEVICE), b["y"].to(DEVICE), b["pid"].to(DEVICE)
+        y_log = torch.log1p(y_raw.clamp_min(0))                    # seguridad
+        ŷ_log = model(x, pid, src_key_padding_mask=~m)
+        loss  = torch.nn.functional.mse_loss(ŷ_log[m], y_log[m])
+        if torch.isnan(loss) or torch.isinf(loss):
+            continue                              # ← descarta el batch
+        if train:
+            opt.zero_grad(); loss.backward(); opt.step()
+        ŷ_raw = torch.expm1(ŷ_log).clamp_min(0)
+        err = torch.abs((ŷ_raw - y_raw) / (y_raw.abs() + EPS))
+        tot += err[m].sum().item(); n += m.sum().item()
+    return (tot / max(n, 1)) * 100.0
 
-        ŷ_log = model(x, pid, ph, src_key_padding_mask=~m)
-        loss_mape  = (torch.abs((torch.expm1(ŷ_log)-y)/(y.abs()+EPS))[m]).mean()
-        loss_shape = shape_loss(ŷ_log, dy)[None]          # broadcast
-        loss = loss_mape + 0.1*loss_shape
-
-        if train: opt.zero_grad(); loss.backward(); opt.step()
-
-        tot += loss_mape.item()*real.item()
-        n   += real.item()
-    return (tot/max(n,1))*100.0         # MAPE %
 
 # ---------- main ----------------------------------------------------------
 def main():
@@ -126,7 +124,7 @@ def main():
                 break
 
     # ---------- test ----------
-    ckpt = torch.load(MODEL_DIR/"model.pt", map_location=DEVICE, weights_only=True)
+    ckpt = torch.load(MODEL_DIR/"model.pt", map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt)  # weights_only True → dict plano
     test = run_epoch(te_ld, model)
     logger.info("🧪  Test MAPE: %.2f%%", test)
