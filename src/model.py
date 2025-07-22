@@ -1,45 +1,37 @@
 """
-model.py – Arquitectura Transformer para series temporales de E2.
+model.py – Transformer con embeddings de paciente, fase y posición sen-cos.
 """
-
 from __future__ import annotations
-import torch
-import torch.nn as nn
+import torch, math, torch.nn as nn
 
 class HormoneTransformer(nn.Module):
     def __init__(
-        self,
-        num_features: int,
-        num_patients: int,
-        d_model: int = 64,
-        nhead: int = 4,
-        num_layers: int = 4,
-        d_ff: int = 256,
-        dropout: float = 0.1,
+        self, *, num_features:int, num_patients:int,
+        d_model:int, nhead:int, num_layers:int, d_ff:int, dropout:float
     ):
         super().__init__()
-        self.d_model = d_model
+        self.num_proj = nn.Linear(num_features, d_model, bias=False)
+        self.pos_dropout = nn.Dropout(dropout)
 
-        self.num_proj = nn.Linear(num_features, d_model)
-        self.pid_emb = nn.Embedding(num_patients, d_model)
+        self.pid_emb   = nn.Embedding(num_patients, d_model)
+        self.phase_emb = nn.Embedding(3, d_model)        # 0,1,2
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_ff,
-            dropout=dropout, activation="relu", batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.head = nn.Linear(d_model, 1)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, d_ff, dropout, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.head    = nn.Linear(d_model, 1)
 
-    def forward(self, x, pid, src_key_padding_mask=None):
+    def forward(self, x_num, pid, phase,
+                src_key_padding_mask=None):
         """
-        x : (b, S, F)
-        pid : (b,)
-        src_key_padding_mask : (b, S) con True en posiciones a ignorar
+        x_num : (B,S,F)  – características normalizadas
+        pid   : (B,)     – índice paciente
+        phase : (B,S)    – 0/1/2
         """
-        b, s, _ = x.shape
-        num_vec = self.num_proj(x)                                # (b, S, d)
-        pid_vec = self.pid_emb(pid).unsqueeze(1).expand(b, s, -1) # (b, S, d)
-        h = num_vec + pid_vec
-        enc = self.encoder(h, src_key_padding_mask=src_key_padding_mask)
-        out = self.head(enc).squeeze(-1)                          # (b, S)
-        return out
+        B,S,_ = x_num.shape
+        num_vec = self.num_proj(x_num)                   # (B,S,D)
+        pid_vec = self.pid_emb(pid).unsqueeze(1).expand(-1,S,-1)
+        ph_vec  = self.phase_emb(phase)                  # (B,S,D)
+        src = self.pos_dropout(num_vec + pid_vec + ph_vec)
+        enc = self.encoder(src, src_key_padding_mask=src_key_padding_mask)
+        return self.head(enc).squeeze(-1)                # (B,S)
