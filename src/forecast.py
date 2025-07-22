@@ -48,7 +48,12 @@ def mc_dropout_predict(model, x, pid, days, phase, mask, mc=100):
     preds = []
     with torch.no_grad():
         for _ in range(mc):
-            y_log = model(x, pid, days, phase, src_key_padding_mask=~mask)
+            y_log = model(
+                x, pid,
+                days  = days,
+                phase = phase,
+                src_key_padding_mask = ~mask,
+            )
             preds.append(torch.expm1(y_log).clamp_min(0).cpu().numpy())
     arr = np.stack(preds)      # (mc, 1, S)
     return arr.mean(0).squeeze(0), arr.std(0).squeeze(0)
