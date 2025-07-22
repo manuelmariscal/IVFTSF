@@ -84,7 +84,13 @@ def run_epoch(dl, model, opt=None):
         phase = b["phase"].to(DEVICE)
 
         y_log = torch.log1p(y_raw.clamp_min(0))
-        ŷ_log = model(x, pid, days, phase, src_key_padding_mask=~m)
+        ŷ_log = model(
+        x, pid,
+        days=days,
+        phase=phase,
+        src_key_padding_mask=~m,
+        )
+
 
         loss  = torch.nn.functional.mse_loss(ŷ_log[m], y_log[m]) \
               + 0.1 * shape_loss(ŷ_log.squeeze(0), days.squeeze(0))  # ponderamos
@@ -133,7 +139,7 @@ def main():
                             weight_decay=HP["weight_decay"])
 
     # 3) Entrenamiento con early‑stopping ----------------------------------
-    best, patience, PATIENCE_MAX = float("inf"), 0, 6
+    best, patience, PATIENCE_MAX = float("inf"), 0, 15
     for ep in range(1, HP["epochs"] + 1):
         tr = run_epoch(tr_ld, model, opt)
         va = run_epoch(va_ld, model)
