@@ -1,0 +1,12 @@
+# ─── Archivos grandes / generados ─────────────────────
+data/
+models/
+logs/
+*.png
+*.csv
+
+# ─── Python ───────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+env/
